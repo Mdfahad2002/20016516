@@ -1,0 +1,82 @@
+pipeline {
+    agent any
+    environment {
+        AZURE_SUBSCRIPTION_ID = '<AZURE_SUBSCRIPTION_ID>'
+        AZURE_CLIENT_ID = '<AZURE_CLIENT_ID>'
+        AZURE_CLIENT_SECRET = '<AZURE_CLIENT_SECRET>'
+        AZURE_TENANT_ID = '<AZURE_TENANT_ID>'
+        RESOURCE_GROUP_NAME = 'example-resources'  // Name of your resource group in Azure
+        VM_NAME = 'example-vm' // Name of your virtual machine
+        IMAGE_NAME = '<IMAGE_NAME>'
+        PUBLIC_IP = '<PUBLIC_IP>'  // This will be dynamically fetched from Terraform output
+    }
+    stages {
+        stage('Clone Repository') {
+            steps {
+                git branch: 'master', url: 'https://github.com/mouzamali123/node-web-app'
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    // Build Docker image and tag it
+                    sh "docker build -t ${IMAGE_NAME} ./node-js"
+                    sh "docker tag ${IMAGE_NAME}:latest ${PUBLIC_IP}:latest"  // You might need to tag the image with the VM's IP
+                }
+            }
+        }
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    // Push the built image to a container registry (could be Docker Hub, Azure Container Registry, etc.)
+                    sh "docker push ${PUBLIC_IP}:latest"  // Adjust this depending on your registry
+                }
+            }
+        }
+        stage('Deploy to Azure VM') {
+            steps {
+                script {
+                    // Authenticate with Azure using a Service Principal
+                    withCredentials([string(credentialsId: 'azure-sp-password', variable: 'AZURE_CREDENTIALS')]) {
+                        sh '''
+                        az login --service-principal -u ${AZURE_CLIENT_ID} -p ${AZURE_CLIENT_SECRET} --tenant ${AZURE_TENANT_ID}
+                        az vm list-ip-addresses --name ${VM_NAME} --resource-group ${RESOURCE_GROUP_NAME} --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" --output tsv > public_ip.txt
+                        PUBLIC_IP=$(cat public_ip.txt)
+                        echo "VM Public IP: $PUBLIC_IP"
+                        '''
+                    }
+
+                    // Use the public IP for SSH access to deploy the container on the Azure VM
+                    withCredentials([sshUserPrivateKey(credentialsId: 'azure-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                        echo "SSH key has been loaded successfully."
+                        // Deploy the Docker container to the Azure VM
+                        sh """
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${PUBLIC_IP} <<EOF
+                            echo "Starting deployment..."
+                            # Pull the latest image from your registry
+                            docker pull ${PUBLIC_IP}:latest
+                            # Stop and remove the existing container if it exists
+                            docker stop ${IMAGE_NAME} || true
+                            docker rm ${IMAGE_NAME} || true
+                            # Run the new container
+                            docker run -d --name ${IMAGE_NAME} -p 3000:3000 ${PUBLIC_IP}:latest
+EOF
+                        """
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Cleaning up resources...'
+            // Any additional cleanup steps can go here
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
